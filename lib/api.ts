@@ -83,7 +83,8 @@ export async function streamChatMessage(
       }
       buffer += decoder.decode(result.value, { stream: true });
 
-      const frames = buffer.split("\n\n");
+      // SSE frames are separated by a blank line — \n\n or \r\n\r\n.
+      const frames = buffer.split(/\r?\n\r?\n/);
       buffer = frames.pop() ?? "";
 
       for (const frame of frames) {
