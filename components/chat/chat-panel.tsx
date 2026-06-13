@@ -7,7 +7,7 @@ import {
   RiStopCircleLine,
   RiUser3Line,
 } from "@remixicon/react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -20,26 +20,61 @@ interface Message {
   content: string;
 }
 
+interface PersistedChat {
+  threadId: string;
+  messages: Message[];
+}
+
+const STORAGE_KEY = "personal-sensei-chat";
+
+function readStoredChat(): PersistedChat | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw === null ? null : (JSON.parse(raw) as PersistedChat);
+  } catch {
+    // localStorage missing (SSR) or corrupt — treat as no saved chat.
+    return null;
+  }
+}
+
+// Hydration-safe "are we on the client" flag: false during SSR and the first
+// client render, true afterwards. Lets us restore messages without a mismatch.
+const subscribeNoop = () => () => {
+  // No external store to subscribe to; the snapshot never changes.
+};
+const getClientSnapshot = () => true;
+const getServerSnapshot = () => false;
+
 export function ChatPanel() {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(
+    () => readStoredChat()?.messages.filter((message) => message.content !== "") ?? [],
+  );
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const isHydrated = useSyncExternalStore(subscribeNoop, getClientSnapshot, getServerSnapshot);
 
-  const idRef = useRef(0);
   const threadIdRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const nextId = () => {
-    idRef.current += 1;
-    return String(idRef.current);
-  };
-
   const threadId = () => {
-    threadIdRef.current ??= crypto.randomUUID();
+    threadIdRef.current ??= readStoredChat()?.threadId ?? crypto.randomUUID();
     return threadIdRef.current;
   };
+
+  // Persist the conversation whenever it changes.
+  useEffect(() => {
+    if (threadIdRef.current === null) {
+      return;
+    }
+    try {
+      const payload: PersistedChat = { threadId: threadIdRef.current, messages };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // Storage unavailable or over quota — non-fatal.
+    }
+  }, [messages]);
 
   const send = () => {
     const text = input.trim();
@@ -47,10 +82,10 @@ export function ChatPanel() {
       return;
     }
 
-    const assistantId = nextId();
+    const assistantId = crypto.randomUUID();
     setMessages((prev) => [
       ...prev,
-      { id: nextId(), role: "user", content: text },
+      { id: crypto.randomUUID(), role: "user", content: text },
       { id: assistantId, role: "assistant", content: "" },
     ]);
     setInput("");
@@ -90,6 +125,11 @@ export function ChatPanel() {
     setMessages([]);
     setError(null);
     setIsStreaming(false);
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // Storage unavailable — non-fatal.
+    }
   };
 
   useEffect(() => {
@@ -99,7 +139,9 @@ export function ChatPanel() {
     }
   }, [messages, isStreaming]);
 
-  const isEmpty = messages.length === 0;
+  // Render the empty state during SSR/hydration so restored messages (client
+  // only) don't trigger a hydration mismatch.
+  const conversationEmpty = !isHydrated || messages.length === 0;
 
   return (
     <div className="mx-auto flex h-full w-full max-w-2xl flex-col">
@@ -111,13 +153,18 @@ export function ChatPanel() {
             <p className="text-xs text-muted-foreground">Your personal AI tutor</p>
           </div>
         </div>
-        <Button variant="ghost" size="sm" onClick={newChat} disabled={isEmpty && !isStreaming}>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={newChat}
+          disabled={conversationEmpty && !isStreaming}
+        >
           New chat
         </Button>
       </header>
 
       <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto px-4 py-6">
-        {isEmpty ? (
+        {conversationEmpty ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-muted-foreground">
             <RiRobot2Line className="size-10 opacity-40" />
             <p className="text-sm">Ask me anything — I&apos;m here to help you learn.</p>
