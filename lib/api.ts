@@ -1,5 +1,3 @@
-const API_URL = process.env["NEXT_PUBLIC_API_URL"] ?? "http://localhost:8000";
-
 interface ChatResponse {
   reply: string;
 }
@@ -24,7 +22,7 @@ interface StreamHandlers {
 
 /** Send a message to the tutor agent and resolve with its full reply. */
 export async function sendChatMessage(message: string, threadId: string): Promise<string> {
-  const response = await fetch(`${API_URL}/api/v1/chat`, {
+  const response = await fetch("/api/v1/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message, thread_id: threadId }),
@@ -60,7 +58,7 @@ export async function streamChatMessage(
   const { onToken, onError, onDone, signal } = handlers;
 
   try {
-    const response = await fetch(`${API_URL}/api/v1/chat/stream`, {
+    const response = await fetch("/api/v1/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, thread_id: threadId }),
