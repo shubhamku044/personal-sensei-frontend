@@ -7,10 +7,13 @@ import {
   RiStopCircleLine,
   RiUser3Line,
 } from "@remixicon/react";
+import { useMutation } from "@tanstack/react-query";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
+import { Markdown } from "@/components/chat/markdown";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { useSmoothText } from "@/hooks/use-smooth-text";
 import { streamChatMessage } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -50,8 +53,6 @@ export function ChatPanel() {
     () => readStoredChat()?.messages.filter((message) => message.content !== "") ?? [],
   );
   const [input, setInput] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const isHydrated = useSyncExternalStore(subscribeNoop, getClientSnapshot, getServerSnapshot);
 
   const threadIdRef = useRef<string | null>(null);
@@ -61,6 +62,68 @@ export function ChatPanel() {
   const threadId = () => {
     threadIdRef.current ??= readStoredChat()?.threadId ?? crypto.randomUUID();
     return threadIdRef.current;
+  };
+
+  // The send lifecycle is a React Query mutation: it owns pending/error state
+  // while the streamed deltas are appended to the assistant message.
+  const chat = useMutation({
+    mutationFn: ({ message, assistantId }: { message: string; assistantId: string }) =>
+      new Promise<void>((resolve, reject) => {
+        const controller = new AbortController();
+        abortRef.current = controller;
+        controller.signal.addEventListener("abort", () => {
+          resolve();
+        });
+        void streamChatMessage(message, threadId(), {
+          signal: controller.signal,
+          onToken: (token) => {
+            setMessages((prev) =>
+              prev.map((message_) =>
+                message_.id === assistantId
+                  ? { ...message_, content: message_.content + token }
+                  : message_,
+              ),
+            );
+          },
+          onError: (errorMessage) => {
+            reject(new Error(errorMessage));
+          },
+          onDone: resolve,
+        });
+      }),
+  });
+
+  const isStreaming = chat.isPending;
+
+  const send = () => {
+    const text = input.trim();
+    if (text === "" || isStreaming) {
+      return;
+    }
+    const assistantId = crypto.randomUUID();
+    setMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: "user", content: text },
+      { id: assistantId, role: "assistant", content: "" },
+    ]);
+    setInput("");
+    chat.mutate({ message: text, assistantId });
+  };
+
+  const stop = () => {
+    abortRef.current?.abort();
+  };
+
+  const newChat = () => {
+    abortRef.current?.abort();
+    threadIdRef.current = null;
+    setMessages([]);
+    chat.reset();
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // Storage unavailable — non-fatal.
+    }
   };
 
   // Persist the conversation whenever it changes.
@@ -76,62 +139,6 @@ export function ChatPanel() {
     }
   }, [messages]);
 
-  const send = () => {
-    const text = input.trim();
-    if (text === "" || isStreaming) {
-      return;
-    }
-
-    const assistantId = crypto.randomUUID();
-    setMessages((prev) => [
-      ...prev,
-      { id: crypto.randomUUID(), role: "user", content: text },
-      { id: assistantId, role: "assistant", content: "" },
-    ]);
-    setInput("");
-    setError(null);
-    setIsStreaming(true);
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    void streamChatMessage(text, threadId(), {
-      signal: controller.signal,
-      onToken: (token) => {
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === assistantId ? { ...message, content: message.content + token } : message,
-          ),
-        );
-      },
-      onError: (message) => {
-        setError(message);
-        setIsStreaming(false);
-      },
-      onDone: () => {
-        setIsStreaming(false);
-      },
-    });
-  };
-
-  const stop = () => {
-    abortRef.current?.abort();
-    setIsStreaming(false);
-  };
-
-  const newChat = () => {
-    abortRef.current?.abort();
-    threadIdRef.current = null;
-    setMessages([]);
-    setError(null);
-    setIsStreaming(false);
-    try {
-      localStorage.removeItem(STORAGE_KEY);
-    } catch {
-      // Storage unavailable — non-fatal.
-    }
-  };
-
   useEffect(() => {
     const el = scrollRef.current;
     if (el !== null) {
@@ -142,6 +149,7 @@ export function ChatPanel() {
   // Render the empty state during SSR/hydration so restored messages (client
   // only) don't trigger a hydration mismatch.
   const conversationEmpty = !isHydrated || messages.length === 0;
+  const lastMessageId = messages[messages.length - 1]?.id;
 
   return (
     <div className="mx-auto flex h-full w-full max-w-2xl flex-col">
@@ -174,15 +182,15 @@ export function ChatPanel() {
             <MessageBubble
               key={message.id}
               message={message}
-              streaming={isStreaming && message.id === messages[messages.length - 1]?.id}
+              streaming={isStreaming && message.id === lastMessageId}
             />
           ))
         )}
 
-        {error !== null ? (
+        {chat.isError ? (
           <div className="flex items-center gap-2 border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             <RiErrorWarningLine className="size-4 shrink-0" />
-            <span>{error}</span>
+            <span>{chat.error.message}</span>
           </div>
         ) : null}
       </div>
@@ -230,7 +238,19 @@ export function ChatPanel() {
 
 function MessageBubble({ message, streaming }: { message: Message; streaming: boolean }) {
   const isUser = message.role === "user";
-  const showCaret = streaming && message.role === "assistant";
+  const smoothed = useSmoothText(message.content, streaming && !isUser);
+  const text = isUser ? message.content : smoothed;
+  const showThinking = !isUser && streaming && text === "";
+
+  const renderBody = () => {
+    if (isUser) {
+      return text;
+    }
+    if (showThinking) {
+      return <span className="text-muted-foreground">Sensei is thinking…</span>;
+    }
+    return <Markdown content={text} />;
+  };
 
   return (
     <div className={cn("flex items-start gap-2.5", isUser && "flex-row-reverse")}>
@@ -244,20 +264,13 @@ function MessageBubble({ message, streaming }: { message: Message; streaming: bo
       </div>
       <div
         className={cn(
-          "max-w-[80%] px-3 py-2 text-sm whitespace-pre-wrap",
+          "max-w-[80%] px-3 py-2 text-sm",
           isUser
-            ? "bg-primary text-primary-foreground"
+            ? "bg-primary whitespace-pre-wrap text-primary-foreground"
             : "border border-border bg-card text-card-foreground",
         )}
       >
-        {message.content === "" && showCaret ? (
-          <span className="text-muted-foreground">Sensei is thinking…</span>
-        ) : (
-          message.content
-        )}
-        {showCaret && message.content !== "" ? (
-          <span className="ml-0.5 inline-block w-1.5 animate-pulse">▋</span>
-        ) : null}
+        {renderBody()}
       </div>
     </div>
   );
